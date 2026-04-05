@@ -430,16 +430,17 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 self.produced -= d.pwr_produced
 
                 # only positive pwr_offgrid must be taken into account, negative values count a solarInput
-                if (home := -d.homeInput.asInt + max(0, d.pwr_offgrid)) < 0:
+                home = -d.homeInput.asInt + max(0, d.pwr_offgrid)
+                if home < 0 and d.state != DeviceState.SOCFULL:
                     self.charge.append(d)
                     self.charge_limit += d.fuseGrp.charge_limit(d)
                     self.charge_optimal += d.charge_optimal
                     self.charge_weight += d.pwr_max * (100 - d.electricLevel.asInt)
                     setpoint += -d.homeInput.asInt  # use gridInputPower directly; offgrid consumers are invisible to P1
                 # SOCEMPTY means, it could not discharge the battery, but it is still possible to feed into the home using solarpower or offGrid
-                elif (home := d.homeOutput.asInt) > 0:
+                elif (home := d.homeOutput.asInt) > 0 or (d.state == DeviceState.SOCFULL and d.pwr_produced < 0):
                     self.discharge.append(d)
-                    self.discharge_bypass -= d.pwr_produced if d.state == DeviceState.SOCFULL else 0
+                    self.discharge_bypass -= d.pwr_produced if d.pwr_produced < 0 else 0
                     self.discharge_limit += d.fuseGrp.discharge_limit(d)
                     self.discharge_optimal += d.discharge_optimal
                     self.discharge_produced -= d.pwr_produced
@@ -596,19 +597,32 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 pwr = int(setpoint / (len(self.discharge) - i))
             else:
                 pwr = 0
-            # SOCFULL devices should only pass through solar, not drain battery
-            if pwr < -d.pwr_produced and d.state == DeviceState.SOCFULL:
+            # SOCFULL and SOCEMPTY devices should only pass through solar, not drain battery
+            # But SOCFULL can drain battery if no other discharge-capable devices exist
+            if pwr < -d.pwr_produced and d.state == DeviceState.SOCEMPTY:
                 pwr = -d.pwr_produced
+            elif pwr < -d.pwr_produced and d.state == DeviceState.SOCFULL:
+                has_other_dischargeable = any(other.state not in (DeviceState.SOCFULL, DeviceState.SOCEMPTY) for other in self.discharge if other != d)
+                if has_other_dischargeable:
+                    pwr = -d.pwr_produced
+
             self.discharge_weight -= device_weight
 
             # adjust the limit, make sure we have 'enough' power to discharge
             limit -= -d.pwr_produced if solaronly else d.pwr_max
+            min_pwr = 0
+            if d.state == DeviceState.SOCEMPTY:
+                min_pwr = -d.pwr_produced
+            elif d.state == DeviceState.SOCFULL:
+                has_other_dischargeable = any(other.state not in (DeviceState.SOCFULL, DeviceState.SOCEMPTY) for other in self.discharge if other != d)
+                if has_other_dischargeable:
+                    min_pwr = -d.pwr_produced
             if limit < setpoint - pwr:
-                pwr = max(setpoint - limit, 0 if d.state != DeviceState.SOCFULL else -d.pwr_produced)
+                pwr = max(setpoint - limit, min_pwr)
             pwr = min(pwr, setpoint, d.pwr_max)
 
             # make sure we have devices in optimal working range
-            if len(self.discharge) > 1 and i == 0 and d.state != DeviceState.SOCFULL:
+            if len(self.discharge) > 1 and i == 0 and d.state not in (DeviceState.SOCFULL, DeviceState.SOCEMPTY):
                 self.pwr_low = 0 if (delta := d.discharge_start * 1.5 - pwr) <= 0 else self.pwr_low + int(delta)
                 pwr = 0 if self.pwr_low > d.discharge_optimal else pwr
 
